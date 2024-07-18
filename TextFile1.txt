@@ -1,0 +1,343 @@
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using DirectShowLib;
+
+namespace UvcCameraApp
+{
+    public partial class MainForm : Form
+    {
+        private IGraphBuilder graphBuilder;
+        private ICaptureGraphBuilder2 captureGraphBuilder;
+        private IMediaControl mediaControl;
+        private IVideoWindow videoWindow;
+        private IBaseFilter videoRenderer;
+        private DsDevice[] systemCameras;
+        private IBaseFilter sourceFilter; // フィールドとして宣言
+        private enum RenderingMode { EVR, VMR9, AUTO }
+        private RenderingMode currentRenderingMode = RenderingMode.EVR; // Default rendering mode
+
+        public MainForm()
+        {
+            InitializeComponent();
+            LoadCameras();
+        }
+
+        private void LoadCameras()
+        {
+            // Get the list of available video input devices (cameras)
+            systemCameras = DsDevice.GetDevicesOfCat(FilterCategory.VideoInputDevice);
+            foreach (var camera in systemCameras)
+            {
+                comboBoxCameras.Items.Add(camera.Name);
+            }
+            if (comboBoxCameras.Items.Count > 0)
+            {
+                comboBoxCameras.SelectedIndex = 0; // Select the first camera by default
+            }
+        }
+
+        private void buttonStart_Click(object sender, EventArgs e)
+        {
+            InitializeDirectShow(comboBoxCameras.SelectedIndex);
+        }
+
+        private void InitializeDirectShow(int cameraIndex)
+        {
+            try
+            {
+                int hr = 0;
+                // Create the Filter Graph Manager
+                graphBuilder = (IGraphBuilder)new FilterGraph();
+
+                // Create the Capture Graph Builder
+                captureGraphBuilder = (ICaptureGraphBuilder2)new CaptureGraphBuilder2();
+                captureGraphBuilder.SetFiltergraph(graphBuilder);
+
+                // Check if there are any cameras
+                if (systemCameras == null || systemCameras.Length == 0)
+                {
+                    MessageBox.Show("No UVC cameras found.");
+                    return;
+                }
+
+                // Bind Moniker to a filter object
+                object source;
+                Guid baseFilterGuid = typeof(IBaseFilter).GUID;
+                systemCameras[cameraIndex].Mon.BindToObject(null, null, ref baseFilterGuid, out source);
+                sourceFilter = (IBaseFilter)source;
+
+                // Add the video capture filter to the graph
+                hr = graphBuilder.AddFilter(sourceFilter, "Video Capture");
+                DsError.ThrowExceptionForHR(hr);
+
+                // Set the input video format
+                SetInputVideoFormat(sourceFilter);
+
+                // Choose rendering mode
+                switch (currentRenderingMode)
+                {
+                    case RenderingMode.EVR:
+                        UseEVR();
+                        break;
+                    case RenderingMode.VMR9:
+                        UseVMR9();
+                        break;
+                    case RenderingMode.AUTO:
+                        UseAuto();
+                        break;
+                }
+
+                // Set the output video format
+                SetOutputVideoFormat(videoRenderer);
+
+                // Get the Media Control interface
+                mediaControl = (IMediaControl)graphBuilder;
+
+                // Get the Video Window interface
+                videoWindow = (IVideoWindow)graphBuilder;
+
+                ConfigureVideoWindow();
+
+                // Run the graph
+                hr = mediaControl.Run();
+                DsError.ThrowExceptionForHR(hr);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error initializing DirectShow: " + ex.Message);
+            }
+        }
+
+        private void SetInputVideoFormat(IBaseFilter filter)
+        {
+            try
+            {
+                IAMStreamConfig streamConfig = GetStreamConfig(filter, PinDirection.Output);
+                if (streamConfig != null)
+                {
+                    AMMediaType mediaType = new AMMediaType();
+                    VideoInfoHeader videoInfo = new VideoInfoHeader();
+                    videoInfo.BmiHeader = new BitmapInfoHeader();
+                    videoInfo.BmiHeader.Width = 3840;
+                    videoInfo.BmiHeader.Height = 1920;
+                    videoInfo.BmiHeader.BitCount = 24;
+                    videoInfo.BmiHeader.Compression = 0x34363248; // 'H264' in little-endian
+
+                    mediaType.majorType = MediaType.Video;
+                    mediaType.subType = new Guid(0x34363248, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71); // MEDIASUBTYPE_H264
+                    mediaType.formatType = FormatType.VideoInfo;
+                    mediaType.fixedSizeSamples = true;
+                    mediaType.temporalCompression = false;
+                    mediaType.sampleSize = videoInfo.BmiHeader.ImageSize;
+                    mediaType.formatPtr = Marshal.AllocCoTaskMem(Marshal.SizeOf(videoInfo));
+                    Marshal.StructureToPtr(videoInfo, mediaType.formatPtr, false);
+
+                    int hr = streamConfig.SetFormat(mediaType);
+                    if (hr != 0)
+                    {
+                        MessageBox.Show($"Error setting input video format: {DsError.GetErrorText(hr)} (0x{hr:X})");
+                    }
+
+                    // Free the media type
+                    DsUtils.FreeAMMediaType(mediaType);
+                }
+                else
+                {
+                    MessageBox.Show("StreamConfig not found.");
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error setting input video format: " + ex.Message);
+            }
+        }
+
+        private void SetOutputVideoFormat(IBaseFilter filter)
+        {
+            try
+            {
+                IAMStreamConfig streamConfig = GetStreamConfig(filter, PinDirection.Input);
+                if (streamConfig != null)
+                {
+                    AMMediaType mediaType = new AMMediaType();
+                    VideoInfoHeader videoInfo = new VideoInfoHeader();
+                    videoInfo.BmiHeader = new BitmapInfoHeader();
+                    videoInfo.BmiHeader.Width = 3840;
+                    videoInfo.BmiHeader.Height = 1920;
+                    videoInfo.BmiHeader.BitCount = 24;
+                    videoInfo.BmiHeader.Compression = 0; // BI_RGB (Uncompressed)
+
+                    mediaType.majorType = MediaType.Video;
+                    mediaType.subType = MediaSubType.RGB24;
+                    mediaType.formatType = FormatType.VideoInfo;
+                    mediaType.fixedSizeSamples = true;
+                    mediaType.temporalCompression = false;
+                    mediaType.sampleSize = videoInfo.BmiHeader.ImageSize;
+                    mediaType.formatPtr = Marshal.AllocCoTaskMem(Marshal.SizeOf(videoInfo));
+                    Marshal.StructureToPtr(videoInfo, mediaType.formatPtr, false);
+
+                    int hr = streamConfig.SetFormat(mediaType);
+                    DsError.ThrowExceptionForHR(hr);
+
+                    // Free the media type
+                    DsUtils.FreeAMMediaType(mediaType);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error setting output video format: " + ex.Message);
+            }
+        }
+
+        private IAMStreamConfig GetStreamConfig(IBaseFilter filter, PinDirection direction)
+        {
+            IEnumPins pinEnum;
+            int hr = filter.EnumPins(out pinEnum);
+            DsError.ThrowExceptionForHR(hr);
+
+            IPin[] pins = new IPin[1];
+            while (pinEnum.Next(pins.Length, pins, IntPtr.Zero) == 0)
+            {
+                PinDirection pinDir;
+                pins[0].QueryDirection(out pinDir);
+                if (pinDir == direction)
+                {
+                    IAMStreamConfig streamConfig = pins[0] as IAMStreamConfig;
+                    if (streamConfig != null)
+                    {
+                        Marshal.ReleaseComObject(pinEnum);
+                        return streamConfig;
+                    }
+                }
+                Marshal.ReleaseComObject(pins[0]);
+            }
+            Marshal.ReleaseComObject(pinEnum);
+            return null;
+        }
+
+        private void UseEVR()
+        {
+            try
+            {
+                // Create the Enhanced Video Renderer
+                videoRenderer = (IBaseFilter)new EnhancedVideoRenderer();
+                int hr = graphBuilder.AddFilter(videoRenderer, "EVR");
+                DsError.ThrowExceptionForHR(hr);
+
+                // Render the video stream to the EVR
+                hr = captureGraphBuilder.RenderStream(PinCategory.Capture, MediaType.Video, sourceFilter, null, videoRenderer);
+                DsError.ThrowExceptionForHR(hr);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error using EVR: " + ex.Message);
+            }
+        }
+
+        private void UseVMR9()
+        {
+            try
+            {
+                // Create the Video Mixing Renderer 9
+                videoRenderer = (IBaseFilter)new VideoMixingRenderer9();
+                int hr = graphBuilder.AddFilter(videoRenderer, "VMR-9");
+                DsError.ThrowExceptionForHR(hr);
+
+                // Configure the VMR-9
+                IVMRFilterConfig9 filterConfig = videoRenderer as IVMRFilterConfig9;
+                if (filterConfig == null)
+                {
+                    throw new NotSupportedException("VMR-9 is not supported.");
+                }
+
+                hr = filterConfig.SetRenderingMode(VMR9Mode.Windowless);
+                DsError.ThrowExceptionForHR(hr);
+
+                IVMRWindowlessControl9 windowlessCtrl = videoRenderer as IVMRWindowlessControl9;
+                if (windowlessCtrl == null)
+                {
+                    throw new NotSupportedException("VMR-9 Windowless Control is not supported.");
+                }
+
+                hr = windowlessCtrl.SetVideoClippingWindow(panelVideo.Handle);
+                DsError.ThrowExceptionForHR(hr);
+
+                hr = windowlessCtrl.SetAspectRatioMode(VMR9AspectRatioMode.LetterBox);
+                DsError.ThrowExceptionForHR(hr);
+
+                hr = windowlessCtrl.SetVideoPosition(null, DsRect.FromRectangle(panelVideo.ClientRectangle));
+                DsError.ThrowExceptionForHR(hr);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error using VMR9: " + ex.Message);
+            }
+        }
+
+        private void UseAuto()
+        {
+            try
+            {
+                // Automatically select and add the video renderer
+                int hr = captureGraphBuilder.RenderStream(PinCategory.Capture, MediaType.Video, sourceFilter, null, null);
+                DsError.ThrowExceptionForHR(hr);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error using Auto mode: " + ex.Message);
+            }
+        }
+
+        private void ConfigureVideoWindow()
+        {
+            try
+            {
+                // Set the video window to the panelVideo control
+                int hr = videoWindow.put_Owner(panelVideo.Handle);
+                DsError.ThrowExceptionForHR(hr);
+
+                hr = videoWindow.put_WindowStyle(WindowStyle.Child | WindowStyle.ClipSiblings);
+                DsError.ThrowExceptionForHR(hr);
+
+                hr = videoWindow.SetWindowPosition(0, 0, panelVideo.Width, panelVideo.Height);
+                DsError.ThrowExceptionForHR(hr);
+
+                hr = videoWindow.put_Visible(OABool.True);
+                DsError.ThrowExceptionForHR(hr);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error configuring video window: " + ex.Message);
+            }
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            base.OnFormClosed(e);
+
+            // Release DirectShow resources
+            if (mediaControl != null)
+            {
+                mediaControl.Stop();
+            }
+            if (videoRenderer != null)
+            {
+                Marshal.ReleaseComObject(videoRenderer);
+            }
+            if (videoWindow != null)
+            {
+                videoWindow.put_Visible(OABool.False);
+                videoWindow.put_Owner(IntPtr.Zero);
+            }
+            if (graphBuilder != null)
+            {
+                Marshal.ReleaseComObject(graphBuilder);
+            }
+            if (captureGraphBuilder != null)
+            {
+                Marshal.ReleaseComObject(captureGraphBuilder);
+            }
+        }
+    }
+}
